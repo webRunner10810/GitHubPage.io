@@ -49,7 +49,7 @@ function card(meeting, query, go) {
   },
   el('div', { class: 'row-between' },
     el('h3', { class: 'truncate', html: highlight(displayTitle(meeting), query) }),
-    meeting.starred ? el('span', { class: 'faint', style: 'color:#ffcf5c' }, '★') : null),
+    meeting.starred ? el('span', { class: 'starred' }, '★') : null),
   el('div', { class: 'tiny faint' }, fmtDate(meeting.createdAt)),
   el('p', { class: 'snippet', html: highlight(snippetFor(meeting, query), query) }),
   el('div', { class: 'meta' }, ...meta));
@@ -69,19 +69,18 @@ export function mount(root, ctx) {
   });
   const searchbar = el('div', { class: 'searchbar' }, icon('search'), searchInput);
 
-  const filterRow = el('div', { class: 'row', style: 'margin-bottom:12px;gap:8px;flex-wrap:wrap' });
+  const filterRow = el('div', { class: 'row mb-12 gap-8 wrap' });
   const list = el('div', { class: 'stack' });
 
   function renderFilters() {
     filterRow.replaceChildren(
       el('button', {
-        class: `mode-chip${starredOnly ? '' : ''}`,
+        class: 'mode-chip chip-inline',
         type: 'button',
-        style: 'flex:0 0 auto;padding:8px 14px',
         'aria-pressed': String(starredOnly),
         onclick: () => { starredOnly = !starredOnly; renderFilters(); render(); },
       }, starredOnly ? '★ Starred only' : '☆ Starred only'),
-      el('span', { class: 'tiny faint grow', style: 'text-align:right' },
+      el('span', { class: 'tiny faint grow text-right' },
         `${all.length} recording${all.length === 1 ? '' : 's'}`),
     );
   }

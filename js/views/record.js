@@ -6,16 +6,22 @@
  * view re-renders from that, which keeps the two decoupled across remounts.
  */
 
-import { el, fmtClock, haptic, icon } from '../util.js';
-import { banner, confirmSheet, toast } from '../ui.js';
+import { el, fmtClock, fmtDate, haptic, icon } from '../util.js';
+import { banner, confirmSheet, sheet, toast } from '../ui.js';
 import { Recorder, isSupported as recorderSupported } from '../recorder.js';
 import { Transcriber, assignSpeakers, mergeSegments, isSupported as asrSupported } from '../asr.js';
 import { getSettings } from '../settings.js';
-import { newMeeting, saveAudio, saveMeeting, requestPersistence } from '../db.js';
+import {
+  appendLiveChunk, assembleLiveAudio, beginLiveSession, clearLiveSession, getLiveSession,
+  isQuotaError, newMeeting, requestPersistence, saveAudio, saveMeeting, updateLiveSession,
+} from '../db.js';
 import { analyzeMeeting, hasKey } from '../ai.js';
 import { analyzeLocally } from '../local-summary.js';
 
 const LEVEL_BARS = 72;
+
+/** How often the live session row is refreshed with the current duration. */
+const HEARTBEAT_MS = 5000;
 
 let session = null;
 let levels = new Array(LEVEL_BARS).fill(0);
@@ -29,6 +35,44 @@ export function isRecording() {
 
 /* ------------------------------------------------------------- session -- */
 
+/**
+ * Serialise persistence behind one promise chain. Writes from a one-second
+ * timeslice would otherwise interleave, and stopping needs a single thing to
+ * await before it can assemble the file from what landed.
+ */
+function queueWrite(work) {
+  if (!session) return Promise.resolve();
+  session.writes = session.writes.then(work).catch((err) => handleWriteError(err));
+  return session.writes;
+}
+
+/**
+ * A failed write must not cost the user the meeting. Running out of storage
+ * drops the audio and keeps transcribing; anything else is reported once.
+ */
+async function handleWriteError(err) {
+  if (!session || session.audioDropped) return;
+  if (isQuotaError(err)) {
+    session.audioDropped = true;
+    session.keepAudio = false;
+    session.recorder.dropAudio();
+    await updateLiveSession({ audioDropped: true, keepAudio: false }).catch(() => {});
+    toast('This device is out of storage. Audio recording stopped — the transcript is still being saved.', 'err', 6000);
+  } else {
+    console.error('live session write failed', err);
+    toast(`Could not save part of the recording: ${err?.message || err}`, 'err');
+  }
+}
+
+function persistChunk({ blob, index }) {
+  if (!session || !session.keepAudio || session.audioDropped) return;
+  const { meetingId } = session;
+  queueWrite(async () => {
+    await appendLiveChunk(meetingId, index, blob);
+    await updateLiveSession({ chunkCount: index + 1, durationMs: session?.recorder.elapsed() ?? 0 });
+  });
+}
+
 async function startSession() {
   const prefs = getSettings();
   const wantAudio = prefs.captureMode !== 'transcript' && recorderSupported();
@@ -38,12 +82,16 @@ async function startSession() {
   session = {
     recorder,
     transcriber: null,
+    meetingId: crypto.randomUUID ? crypto.randomUUID() : `m${Date.now()}`,
     segments: [],
     interim: '',
     listening: false,
     source,
     language: prefs.language,
-    error: '',
+    keepAudio: wantAudio && prefs.keepAudio,
+    audioDropped: false,
+    writes: Promise.resolve(),
+    heartbeat: 0,
   };
 
   try {
@@ -61,17 +109,42 @@ async function startSession() {
   requestPersistence();
   haptic([12, 40, 12]);
 
+  // Everything below is written as it is captured. If this tab is killed —
+  // which Android does to backgrounded tabs without warning — the next launch
+  // finds the session and offers it back.
+  try {
+    await beginLiveSession({
+      meetingId: session.meetingId,
+      source: session.source,
+      language: session.language,
+      mimeType: recorder.mimeType,
+      keepAudio: session.keepAudio,
+    });
+  } catch (err) {
+    toast(`Could not prepare storage: ${err?.message || err}. Recording anyway, but it will not survive a crash.`, 'err');
+  }
+
   recorder.addEventListener('level', (e) => {
     levels.push(e.detail);
     levels.shift();
   });
   recorder.addEventListener('statechange', emit);
+  recorder.addEventListener('chunk', (e) => persistChunk(e.detail));
+
+  session.heartbeat = setInterval(() => {
+    if (!session || session.recorder.state !== 'recording') return;
+    queueWrite(() => updateLiveSession({ durationMs: session.recorder.elapsed() }));
+  }, HEARTBEAT_MS);
 
   if (wantText) {
     const transcriber = new Transcriber({ clock: () => recorder.elapsed(), lang: session.language });
     transcriber.addEventListener('final', (e) => {
       session.segments.push(e.detail);
       session.interim = '';
+      queueWrite(() => updateLiveSession({
+        segments: session.segments,
+        durationMs: session.recorder.elapsed(),
+      }));
       emit();
     });
     transcriber.addEventListener('interim', (e) => {
@@ -118,9 +191,11 @@ async function discardSession() {
   if (!ok || !session) return;
   session.transcriber?.stop();
   session.recorder.cancel();
+  clearInterval(session.heartbeat);
   session = null;
   levels = new Array(LEVEL_BARS).fill(0);
   emit();
+  await clearLiveSession().catch(() => {});
   toast('Recording discarded.');
 }
 
@@ -129,12 +204,13 @@ async function stopAndSave() {
   if (!session) return null;
   const active = session;
   active.transcriber?.stop();
-  const { blob, durationMs } = await active.recorder.stop();
+  clearInterval(active.heartbeat);
+  const { durationMs, mimeType } = await active.recorder.stop();
 
   // Let a trailing final recognition result land before freezing the text.
-  await new Promise((resolve) => setTimeout(resolve, 350));
+  await new Promise((resolve) => { setTimeout(resolve, 350); });
 
-  let segments = active.segments.slice();
+  const segments = active.segments.slice();
   if (active.interim) {
     segments.push({
       id: `tail-${Date.now()}`,
@@ -146,42 +222,109 @@ async function stopAndSave() {
     });
   }
 
-  const prefs = getSettings();
-  if (prefs.autoSpeakers) segments = assignSpeakers(segments, prefs.speakerGapMs);
-  segments = mergeSegments(segments);
+  // Every chunk write must land before the file is assembled from them.
+  await active.writes.catch(() => {});
 
-  if (!segments.length && !blob) {
-    session = null;
-    levels = new Array(LEVEL_BARS).fill(0);
-    emit();
-    toast('Nothing was captured, so nothing was saved.', 'err');
-    return null;
-  }
-
-  const keepAudio = Boolean(blob) && prefs.keepAudio;
-  const meeting = newMeeting({
+  const meeting = await finalize({
+    meetingId: active.meetingId,
     durationMs,
+    mimeType,
     source: active.source,
     language: active.language,
     segments,
-    hasAudio: keepAudio,
-    audioType: keepAudio ? blob.type : '',
-    audioSize: keepAudio ? blob.size : 0,
+    keepAudio: active.keepAudio && !active.audioDropped,
   });
-
-  try {
-    if (keepAudio) await saveAudio(meeting.id, blob);
-    await saveMeeting(meeting);
-  } catch (err) {
-    toast(`Could not save the recording: ${err?.message || err}`, 'err');
-    return null;
-  }
 
   session = null;
   levels = new Array(LEVEL_BARS).fill(0);
   emit();
-  haptic([10, 30, 10]);
+  if (meeting) haptic([10, 30, 10]);
   return meeting;
+}
+
+/**
+ * Turn a finished — or recovered — session into a saved meeting. Shared by the
+ * normal stop path and by recovery so both produce identical records.
+ */
+async function finalize({ meetingId, durationMs, mimeType, source, language, segments, keepAudio, recovered = false }) {
+  const prefs = getSettings();
+  let text = segments;
+  if (prefs.autoSpeakers) text = assignSpeakers(text, prefs.speakerGapMs);
+  text = mergeSegments(text);
+
+  let blob = null;
+  if (keepAudio) blob = await assembleLiveAudio(meetingId, mimeType).catch(() => null);
+
+  if (!text.length && !blob) {
+    await clearLiveSession().catch(() => {});
+    toast('Nothing was captured, so nothing was saved.', 'err');
+    return null;
+  }
+
+  const meeting = newMeeting({
+    id: meetingId,
+    durationMs,
+    source,
+    language,
+    segments: text,
+    hasAudio: Boolean(blob),
+    audioType: blob?.type || '',
+    audioSize: blob?.size || 0,
+    recovered,
+  });
+
+  try {
+    if (blob) await saveAudio(meeting.id, blob);
+    await saveMeeting(meeting);
+  } catch (err) {
+    if (isQuotaError(err) && blob) {
+      // Keep the words even when the audio will not fit.
+      try {
+        await saveMeeting({ ...meeting, hasAudio: false, audioType: '', audioSize: 0 });
+        await clearLiveSession().catch(() => {});
+        toast('Not enough storage for the audio — the transcript and notes were saved.', 'err', 6000);
+        return { ...meeting, hasAudio: false };
+      } catch { /* fall through to the generic failure below */ }
+    }
+    toast(`Could not save the recording: ${err?.message || err}`, 'err');
+    return null;
+  }
+
+  await clearLiveSession().catch(() => {});
+  return meeting;
+}
+
+/**
+ * An interrupted recording left behind by a killed tab, if there is one and it
+ * captured anything worth keeping.
+ */
+export async function pendingRecovery() {
+  if (session) return null;
+  const live = await getLiveSession().catch(() => null);
+  if (!live) return null;
+  if (!live.segments?.length && !live.chunkCount) {
+    await clearLiveSession().catch(() => {});
+    return null;
+  }
+  return live;
+}
+
+/** Rebuild an interrupted recording into a saved meeting. */
+export function recoverSession(live) {
+  return finalize({
+    meetingId: live.meetingId,
+    durationMs: live.durationMs || 0,
+    mimeType: live.mimeType,
+    source: live.source || 'mic',
+    language: live.language || 'en-US',
+    segments: live.segments || [],
+    keepAudio: Boolean(live.keepAudio) && !live.audioDropped && Boolean(live.chunkCount),
+    recovered: true,
+  });
+}
+
+export function discardRecovery() {
+  return clearLiveSession();
 }
 
 /* ---------------------------------------------------------------- view -- */
@@ -194,7 +337,7 @@ export function mount(root, ctx) {
   const timer = el('div', { class: 'timer' }, '00:00');
   const canvas = el('canvas', { class: 'viz', width: 720, height: 168, 'aria-hidden': 'true' });
   const transcriptBox = el('div', { class: 'live-transcript', 'aria-live': 'polite', 'aria-label': 'Live transcript' });
-  const hintLine = el('p', { class: 'tiny faint center', style: 'margin:0' });
+  const hintLine = el('p', { class: 'tiny faint center flush' });
 
   const recBtn = el('button', { class: 'rec-btn', type: 'button', 'aria-label': 'Start recording', dataset: { state: 'idle' } });
   const leftBtn = el('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Pause', hidden: true }, icon('pause'));
@@ -319,6 +462,7 @@ export function mount(root, ctx) {
         runAnalysis(meeting);
       }
     } else {
+      if (!await offerRecovery(ctx, { allowLater: false })) return;
       await startSession();
     }
   });
@@ -347,7 +491,7 @@ export function mount(root, ctx) {
     canvas,
     el('div', { class: 'rec-controls' }, leftBtn, recBtn, rightBtn),
     hintLine,
-    el('div', { class: 'stack', style: 'width:100%' }, sourceChips, callHint, transcriptBox));
+    el('div', { class: 'stack w-full' }, sourceChips, callHint, transcriptBox));
 
   if (!canRecord && !canTranscribe) {
     view.prepend(banner('This browser supports neither audio recording nor speech recognition. Chrome on Android is the target.', { kind: 'banner-danger' }));
@@ -360,6 +504,7 @@ export function mount(root, ctx) {
   refresh();
   renderTranscript();
   timer.textContent = session ? fmtClock(session.recorder.elapsed()) : '00:00';
+  offerRecovery(ctx);
 
   return () => {
     cancelAnimationFrame(rafId);
@@ -376,9 +521,21 @@ export function mount(root, ctx) {
  * events so the detail view can show it whether or not it was mounted when
  * the run started.
  */
+const analysisRuns = new Map();
+
+/** Cancel an in-flight analysis for one meeting, if there is one. */
+export function cancelAnalysis(meetingId) {
+  const controller = analysisRuns.get(meetingId);
+  if (!controller) return false;
+  controller.abort();
+  analysisRuns.delete(meetingId);
+  return true;
+}
+
 export async function runAnalysis(meeting, { force = false } = {}) {
   if (!force && !getSettings().autoAnalyze) return;
   if (!meeting.segments?.length) return;
+  if (analysisRuns.has(meeting.id)) return;
 
   const announce = (type, detail) => window.dispatchEvent(new CustomEvent(type, { detail: { id: meeting.id, ...detail } }));
 
@@ -389,14 +546,78 @@ export async function runAnalysis(meeting, { force = false } = {}) {
     return;
   }
 
+  const controller = new AbortController();
+  analysisRuns.set(meeting.id, controller);
   announce('summary:analysis-start');
   try {
     const analysis = await analyzeMeeting(meeting, {
+      signal: controller.signal,
       onProgress: (stage, pct) => announce('summary:analysis-progress', { stage, pct }),
+      onRetry: ({ attempt, of, waitMs }) => announce('summary:analysis-progress', {
+        stage: `Connection problem — retrying (${attempt} of ${of}) in ${Math.round(waitMs / 1000)}s`,
+        pct: 0.1,
+      }),
     });
     await saveMeeting({ ...meeting, analysis });
     announce('summary:analysis-done', { local: false });
   } catch (err) {
-    announce('summary:analysis-error', { message: err?.message || String(err) });
+    if (err?.name === 'AbortError') announce('summary:analysis-cancelled');
+    else announce('summary:analysis-error', { message: err?.message || String(err) });
+  } finally {
+    analysisRuns.delete(meeting.id);
   }
+}
+
+/* ------------------------------------------------------------ recovery -- */
+
+let recoveryOffered = false;
+
+/**
+ * Resolve an interrupted recording. On mount the user may defer; before a new
+ * recording they may not, because starting one replaces the stored session and
+ * deferring twice would silently destroy the earlier meeting.
+ *
+ * @returns {Promise<boolean>} true when nothing is left pending.
+ */
+async function offerRecovery(ctx, { allowLater = true } = {}) {
+  if (session) return true;
+  if (allowLater && recoveryOffered) return true;
+  const live = await pendingRecovery();
+  if (!live) return true;
+  recoveryOffered = true;
+
+  const words = (live.segments || []).reduce((n, seg) => n + seg.text.split(/\s+/).length, 0);
+  const captured = [
+    fmtClock(live.durationMs || 0),
+    live.chunkCount ? 'audio' : null,
+    words ? `${words} words` : null,
+  ].filter(Boolean).join(' · ');
+
+  const choice = await sheet((close) => el('div', { class: 'stack' },
+    el('h2', {}, 'Unsaved recording found'),
+    el('p', { class: 'small muted flush' },
+      `A recording from ${fmtDate(live.startedAt)} was interrupted before it could be saved — the tab was closed or the phone reclaimed it. ${captured} was captured.`),
+    el('button', { class: 'btn btn-primary btn-block', type: 'button', onclick: () => close('recover') },
+      icon('refresh'), 'Recover it'),
+    el('button', { class: 'btn btn-danger btn-block', type: 'button', onclick: () => close('discard') },
+      icon('trash'), 'Discard it'),
+    allowLater
+      ? el('button', { class: 'btn btn-ghost btn-block', type: 'button', onclick: () => close('later') }, 'Decide later')
+      : null), { dismissible: false });
+
+  if (choice === 'recover') {
+    const meeting = await recoverSession(live);
+    if (meeting) {
+      toast('Recording recovered.', 'ok');
+      ctx.go(`#/meeting/${meeting.id}`);
+      runAnalysis(meeting);
+    }
+    return true;
+  }
+  if (choice === 'discard') {
+    await discardRecovery();
+    toast('Unsaved recording discarded.');
+    return true;
+  }
+  return false;
 }

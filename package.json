@@ -1,0 +1,25 @@
+{
+  "name": "summary-meeting-notes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Record, transcribe and summarise meetings \u2014 an offline-first PWA for Android.",
+  "type": "module",
+  "scripts": {
+    "lint": "eslint .",
+    "check": "node tools/check-static.mjs",
+    "test": "npm run lint && npm run check && npm run test:unit && npm run test:e2e",
+    "test:unit": "node --test \"test/unit/**/*.test.js\"",
+    "test:e2e": "playwright test",
+    "serve": "python3 -m http.server 8000",
+    "icons": "python3 tools/make_icons.py",
+    "stamp": "node tools/stamp-version.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "eslint": "^9.15.0",
+    "globals": "^15.12.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

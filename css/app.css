@@ -496,6 +496,30 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .progress { height: 4px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
 .progress i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.25s ease; }
 
+/* Layout utilities.
+   These exist so no element needs an inline `style` attribute: the CSP sets
+   `style-src 'self'`, which blocks inline styles outright. Genuinely dynamic
+   values (a progress bar's width) are set through CSSOM instead, which CSP
+   allows. */
+.flush { margin: 0; }
+.mt-6 { margin-top: 6px; }
+.mb-6 { margin-bottom: 6px; }
+.mb-8 { margin-bottom: 8px; }
+.mb-10 { margin-bottom: 10px; }
+.mb-12 { margin-bottom: 12px; }
+.mb-14 { margin-bottom: 14px; }
+.empty-copy { margin: 0 0 16px; }
+.gap-6 { gap: 6px; }
+.gap-8 { gap: 8px; }
+.wrap { flex-wrap: wrap; }
+.w-full { width: 100%; }
+.text-right { text-align: right; }
+.interactive { pointer-events: auto; }
+.pre-wrap { white-space: pre-wrap; }
+.lead { font-size: 15px; line-height: 1.6; }
+.starred { color: #ffcf5c; }
+.chip-inline { flex: 0 0 auto; padding: 8px 14px; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }

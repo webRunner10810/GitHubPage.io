@@ -7,7 +7,7 @@ import { askAboutMeeting, hasKey } from '../ai.js';
 import { analyzeLocally } from '../local-summary.js';
 import { assignSpeakers } from '../asr.js';
 import { getSettings } from '../settings.js';
-import { runAnalysis } from './record.js';
+import { cancelAnalysis, runAnalysis } from './record.js';
 import {
   baseFilename, canShare, copyToClipboard, displayTitle, downloadAudio, downloadText,
   shareMeeting, toJson, toMarkdown, toPlainText,
@@ -27,6 +27,7 @@ export function mount(root, ctx, params) {
   let audioUrl = null;
   let analysisState = null;   // { stage, pct } while a run is in flight
   let editMode = false;
+  const askController = new AbortController();
 
   const body = el('div', {});
   const audio = el('audio', { preload: 'metadata' });
@@ -210,7 +211,7 @@ export function mount(root, ctx, params) {
       });
       return el('div', { class: 'stack' },
         el('h2', {}, 'Rename speakers'),
-        el('p', { class: 'small muted', style: 'margin:0' },
+        el('p', { class: 'small muted flush' },
           'Speakers are split by pause length, so the labels are a guess. Naming them here also improves the AI analysis.'),
         ...fields,
         el('button', {
@@ -368,10 +369,20 @@ export function mount(root, ctx, params) {
     const stack = el('div', { class: 'stack' });
 
     if (analysisState) {
+      const bar = el('i');
+      bar.style.width = `${Math.round((analysisState.pct || 0) * 100)}%`;
       stack.append(el('div', { class: 'card stack' },
-        el('div', { class: 'row' }, el('div', { class: 'spinner' }),
-          el('span', { class: 'small' }, analysisState.stage || 'Analysing…')),
-        el('div', { class: 'progress' }, el('i', { style: `width:${Math.round((analysisState.pct || 0) * 100)}%` }))));
+        el('div', { class: 'row-between' },
+          el('div', { class: 'row' }, el('div', { class: 'spinner' }),
+            el('span', { class: 'small' }, analysisState.stage || 'Analysing…')),
+          el('button', {
+            class: 'btn btn-sm btn-ghost',
+            type: 'button',
+            onclick: () => {
+              if (cancelAnalysis(id)) toast('Analysis cancelled.');
+            },
+          }, 'Cancel')),
+        el('div', { class: 'progress' }, bar)));
     }
 
     if (!a && !analysisState) {
@@ -395,25 +406,25 @@ export function mount(root, ctx, params) {
 
     stack.append(el('div', { class: 'card stack' },
       el('div', { class: 'section-title' }, 'Summary'),
-      el('p', { style: 'margin:0;font-size:15px;line-height:1.6' }, a.summary || '—'),
-      a.topics?.length ? el('div', { class: 'row', style: 'flex-wrap:wrap;gap:6px' },
+      el('p', { class: 'flush lead' }, a.summary || '—'),
+      a.topics?.length ? el('div', { class: 'row wrap gap-6' },
         ...a.topics.map((t) => el('span', { class: 'pill pill-accent' }, t))) : null,
-      a.sentiment?.note ? el('p', { class: 'tiny faint', style: 'margin:0' },
+      a.sentiment?.note ? el('p', { class: 'tiny faint flush' },
         `Tone: ${a.sentiment.overall} — ${a.sentiment.note}`) : null));
 
     if (a.keyPoints?.length) {
       stack.append(el('div', { class: 'card' },
-        el('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Key points'),
+        el('div', { class: 'section-title mb-8' }, 'Key points'),
         el('ul', { class: 'bullets' }, ...a.keyPoints.map((p) => el('li', {}, p)))));
     }
     if (a.decisions?.length) {
       stack.append(el('div', { class: 'card' },
-        el('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Decisions'),
+        el('div', { class: 'section-title mb-8' }, 'Decisions'),
         el('ul', { class: 'bullets' }, ...a.decisions.map((d) => el('li', {}, d)))));
     }
     if (a.openQuestions?.length) {
       stack.append(el('div', { class: 'card' },
-        el('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Open questions'),
+        el('div', { class: 'section-title mb-8' }, 'Open questions'),
         el('ul', { class: 'bullets' }, ...a.openQuestions.map((q) => el('li', {}, q)))));
     }
     if (a.followUpEmail) {
@@ -428,7 +439,7 @@ export function mount(root, ctx, params) {
               toast(ok ? 'Draft copied.' : 'Could not copy.', ok ? 'ok' : 'err');
             },
           }, icon('copy'), 'Copy')),
-        el('p', { class: 'small', style: 'margin:0;white-space:pre-wrap' }, a.followUpEmail)));
+        el('p', { class: 'small flush pre-wrap' }, a.followUpEmail)));
     }
 
     stack.append(el('p', { class: 'tiny faint center' },
@@ -444,9 +455,9 @@ export function mount(root, ctx, params) {
       return emptyState('doc', 'No transcript', 'Nothing was recognised for this recording. Live transcription needs Chrome and a network connection.');
     }
 
-    const toolbar = el('div', { class: 'row-between', style: 'margin-bottom:10px' },
+    const toolbar = el('div', { class: 'row-between mb-10' },
       el('span', { class: 'tiny faint' }, `${segments.length} segments · ${segments.reduce((n, s) => n + s.text.split(' ').length, 0)} words`),
-      el('div', { class: 'row', style: 'gap:6px' },
+      el('div', { class: 'row gap-6' },
         el('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: openSpeakerSheet }, 'Speakers'),
         el('button', {
           class: 'btn btn-sm btn-ghost',
@@ -580,11 +591,12 @@ export function mount(root, ctx, params) {
       try {
         const answer = await askAboutMeeting(meeting, question, {
           history,
+          signal: askController.signal,
           onText: (_delta, full) => { pending.textContent = full; },
         });
         await persist({ chat: [...(meeting.chat || []), { role: 'assistant', text: answer, at: Date.now() }] });
       } catch (err) {
-        toast(err?.message || 'The question failed.', 'err');
+        if (err?.name !== 'AbortError') toast(err?.message || 'The question failed.', 'err');
       } finally {
         sendBtn.disabled = false;
         renderLog();
@@ -611,8 +623,8 @@ export function mount(root, ctx, params) {
         el('a', { class: 'btn', href: '#/library' }, 'Back to library')));
       return;
     }
-    const header = el('div', { class: 'stack', style: 'margin-bottom:14px' },
-      el('div', { class: 'row', style: 'gap:6px;flex-wrap:wrap' },
+    const header = el('div', { class: 'stack mb-14' },
+      el('div', { class: 'row gap-6 wrap' },
         el('span', { class: 'pill' }, icon('clock'), fmtDuration(meeting.durationMs)),
         el('span', { class: 'pill' }, meeting.source === 'call' ? 'Phone call' : 'Microphone'),
         el('span', { class: 'pill' }, fmtDate(meeting.createdAt))),
@@ -651,11 +663,17 @@ export function mount(root, ctx, params) {
     render();
     toast(e.detail.message, 'err');
   };
+  const onCancelled = (e) => {
+    if (e.detail.id !== id) return;
+    analysisState = null;
+    render();
+  };
 
   window.addEventListener('summary:analysis-progress', onProgress);
   window.addEventListener('summary:analysis-start', onStart);
   window.addEventListener('summary:analysis-done', onDone);
   window.addEventListener('summary:analysis-error', onError);
+  window.addEventListener('summary:analysis-cancelled', onCancelled);
   window.addEventListener('scroll', onScroll, { passive: true });
 
   root.replaceChildren(body, audio);
@@ -671,7 +689,9 @@ export function mount(root, ctx, params) {
     window.removeEventListener('summary:analysis-start', onStart);
     window.removeEventListener('summary:analysis-done', onDone);
     window.removeEventListener('summary:analysis-error', onError);
+    window.removeEventListener('summary:analysis-cancelled', onCancelled);
     window.removeEventListener('scroll', onScroll);
+    askController.abort();
     audio.pause();
     if (audioUrl) URL.revokeObjectURL(audioUrl);
   };

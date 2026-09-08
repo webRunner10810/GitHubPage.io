@@ -27,6 +27,7 @@ only when you run AI analysis with your own Anthropic API key.
 | **Keep** | Search across every recording, tick off action items, star, rename, fix mis-heard words. |
 | **Export** | Markdown, plain text, full JSON, the audio file, or straight into the Android share sheet. |
 | **Offline** | Installs as an app, opens and plays back with no network. Recording and playback work offline; live transcription and AI analysis need a connection. |
+| **Survive a crash** | Audio and transcript are written to storage as they are captured. If Android kills the tab mid-meeting, the next launch offers the recording back instead of losing it. |
 
 ## Recording phone calls — read this first
 
@@ -44,12 +45,28 @@ work around. What works in practice:
 
 ## Setup
 
-Nothing to install or build. Clone it and open `index.html` through any static
-server:
+The app itself has no build step and no runtime dependencies. Clone it and serve
+the directory:
 
 ```bash
 python3 -m http.server 8000     # then open http://localhost:8000
 ```
+
+The dev dependencies in `package.json` are for the test suite and linter only —
+nothing from `node_modules` is shipped.
+
+```bash
+npm install
+npm test          # lint + static checks + unit tests + end-to-end tests
+npm run lint
+npm run check     # static integrity: precache list, imports, manifest, CSP
+npm run test:unit # node:test, no browser needed
+npm run test:e2e  # Playwright at a 412x915 Pixel viewport
+```
+
+`npm run test:e2e` downloads its own Chromium. In a sandbox that already ships
+one, point at it instead:
+`PLAYWRIGHT_CHROMIUM_PATH=/path/to/chromium npm run test:e2e`.
 
 For AI analysis, add an [Anthropic API key](https://console.anthropic.com/) in
 **Settings → AI analysis**. Without one the app still records, transcribes,
@@ -58,14 +75,20 @@ summary that is always labelled as such.
 
 ### About the API key
 
-The key is kept in `localStorage` and sent from the page straight to
-`api.anthropic.com` (which needs the `anthropic-dangerous-direct-browser-access`
-header to allow a browser origin). That is the trade-off a static, server-less
-app makes: the key never goes to any server of ours because there is no server —
-but anything with script access to this origin can read it. Use a key scoped to
-this app, and clear it in Settings when you are done. If you would rather the key
-never touch a browser, put a small proxy in front of the API and point `ENDPOINT`
-in `js/ai.js` at it.
+Two options, and the app supports both:
+
+**Direct (default).** The key is kept in `localStorage` and sent from the page
+straight to `api.anthropic.com` (which needs the
+`anthropic-dangerous-direct-browser-access` header to allow a browser origin).
+It never goes to any server of ours, because there is no server — but anything
+with script access to this origin can read it. Use a key scoped to this app and
+clear it in Settings when you are done.
+
+**Proxied (recommended if the key matters).** Deploy
+[`proxy/cloudflare-worker.js`](proxy/README.md) and paste its URL into
+**Settings → Proxy URL**. The key then lives in the Worker's secret store, the
+page sends no credentials at all, and the API key field disappears from
+Settings because it is no longer needed.
 
 ## Browser support
 
@@ -86,24 +109,37 @@ rather than failing quietly.
 ## Layout
 
 ```
-index.html              app shell
+index.html              app shell (+ Content-Security-Policy)
 manifest.webmanifest    PWA manifest
 sw.js                   service worker (precached shell, offline)
-css/app.css             design tokens + all styling
+css/app.css             design tokens, components, layout utilities
 js/
   app.js                hash router, top bar, SW registration
-  settings.js           preferences + API key (localStorage)
-  db.js                 IndexedDB: meetings + audio blobs
+  settings.js           preferences, API key / proxy URL (localStorage)
+  db.js                 IndexedDB: meetings, audio, and the live session
   recorder.js           getUserMedia + MediaRecorder, level meter, wake lock
   asr.js                Web Speech API wrapper, auto-restart, speaker split
-  ai.js                 Claude Messages API client (streaming, structured output)
+  ai.js                 Messages API client: streaming, retries, structured output
   local-summary.js      on-device extractive fallback
   export.js             Markdown / text / JSON / audio / share sheet
   ui.js                 toasts, bottom sheets, dialogs
   views/                record, library, meeting, settings
+proxy/                  optional Worker that keeps the API key server-side
+test/unit/              node:test suites for the pure logic
+test/e2e/               Playwright flows, including crash recovery
 tools/make_icons.py     regenerates the icon set (stdlib only)
+tools/check-static.mjs  integrity checks a bundler would otherwise catch
+tools/stamp-version.mjs stamps the commit SHA into the SW cache name
 docs/architecture.md    how the pieces fit together
 ```
+
+## CI
+
+`.github/workflows/ci.yml` runs lint, the static checks, the unit tests and the
+Playwright suite on every pull request. `.github/workflows/deploy.yml` publishes
+to Pages on `master`, stamping the commit SHA into the service worker's cache
+name first — without that the cache-first service worker would keep serving the
+previous bundle to returning visitors.
 
 See [`docs/architecture.md`](docs/architecture.md) for the data model, the
 recording clock, and how analysis is prompted.

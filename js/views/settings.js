@@ -9,6 +9,13 @@ import { clearAll, listMeetings, usage } from '../db.js';
 import { testConnection } from '../ai.js';
 import { downloadText } from '../export.js';
 
+/** Storage meter fill. Width is set through CSSOM so no inline style is needed. */
+function usageBar(est) {
+  const bar = el('i');
+  bar.style.width = `${Math.min(100, Math.round((est.used / (est.quota || 1)) * 100))}%`;
+  return bar;
+}
+
 function field(label, control, hint) {
   return el('div', { class: 'field' },
     el('label', {}, label),
@@ -80,12 +87,41 @@ export function mount(root, ctx) {
     }
   });
 
+  const baseUrlInput = el('input', {
+    class: 'input',
+    type: 'url',
+    placeholder: 'https://your-proxy.example.workers.dev',
+    autocomplete: 'off',
+    autocapitalize: 'off',
+    spellcheck: 'false',
+    'aria-label': 'Proxy URL',
+    onchange: (e) => {
+      setSettings({ apiBaseUrl: e.target.value.trim() });
+      renderCredentials();
+    },
+  });
+  baseUrlInput.value = s.apiBaseUrl;
+
+  // The key field is meaningless once a proxy holds the key, so it is swapped
+  // out rather than left there inviting people to enter one anyway.
+  const credentials = el('div', { class: 'stack' });
+  function renderCredentials() {
+    const proxied = Boolean(getSettings().apiBaseUrl.trim());
+    credentials.replaceChildren(
+      proxied
+        ? banner('Requests go to your proxy, which supplies the key. No secret is stored on this device.', { iconName: 'key' })
+        : field('Anthropic API key', keyInput,
+          'Stored in this browser only and sent directly to api.anthropic.com. Anything with script access to this site could read it — use a key scoped to this app, and clear it when you are done. The proxy option below avoids that entirely.'),
+      proxied ? null : el('div', { class: 'row' }, testBtn, el('div', { class: 'grow' })),
+      proxied ? null : keyStatus,
+    );
+  }
+
   container.append(el('div', { class: 'card stack' },
     el('div', { class: 'section-title' }, 'AI analysis'),
-    field('Anthropic API key', keyInput,
-      'Stored in this browser only and sent directly to api.anthropic.com. Anything with script access to this site could read it — use a key scoped to this app, and clear it when you are done.'),
-    el('div', { class: 'row' }, testBtn, el('div', { class: 'grow' })),
-    keyStatus,
+    credentials,
+    field('Proxy URL (optional)', baseUrlInput,
+      'Point this at your own deployment of proxy/cloudflare-worker.js to keep the API key server-side. Leave it blank to call the API directly with the key above.'),
     field('Model', select('model', MODELS)),
     field('Thinking effort', select('effort', EFFORTS), 'Higher effort is slower and costs more, but reads long meetings more carefully.'),
     field('Standing context (optional)', (() => {
@@ -144,9 +180,8 @@ export function mount(root, ctx) {
       el('div', { class: 'section-title' }, 'Data on this device'),
       el('div', { class: 'small muted' },
         `${meetings.length} recording${meetings.length === 1 ? '' : 's'} · ${fmtBytes(audioBytes)} of audio`),
-      est ? el('div', { class: 'stack', style: 'gap:6px' },
-        el('div', { class: 'progress' },
-          el('i', { style: `width:${Math.min(100, Math.round((est.used / (est.quota || 1)) * 100))}%` })),
+      est ? el('div', { class: 'stack gap-6' },
+        el('div', { class: 'progress' }, usageBar(est)),
         el('div', { class: 'tiny faint' }, `${fmtBytes(est.used)} used of about ${fmtBytes(est.quota)} available to this site`)) : null,
       el('button', {
         class: 'btn btn-block btn-sm',
@@ -218,12 +253,13 @@ export function mount(root, ctx) {
 
   container.append(el('div', { class: 'card stack' },
     el('div', { class: 'section-title' }, 'Recording other people'),
-    el('p', { class: 'small muted', style: 'margin:0' },
+    el('p', { class: 'small muted flush' },
       'Consent rules for recording a conversation differ by country and by state. Some places require every participant to agree. You are responsible for getting that agreement before you hit record.'),
-    el('p', { class: 'tiny faint', style: 'margin:0' },
+    el('p', { class: 'tiny faint flush' },
       'Audio and transcripts stay on this device. When AI analysis runs, the transcript text — not the audio — is sent to the Anthropic API.')));
 
   root.replaceChildren(container);
+  renderCredentials();
   renderStorage();
   return () => {};
 }

@@ -9,8 +9,12 @@
 
 import { get as getSetting } from './settings.js';
 
-const ENDPOINT = 'https://api.anthropic.com/v1/messages';
+const DEFAULT_BASE_URL = 'https://api.anthropic.com';
 const API_VERSION = '2023-06-01';
+
+/** Transient failures worth retrying, and how many attempts in total. */
+const MAX_ATTEMPTS = 3;
+const BASE_BACKOFF_MS = 800;
 
 /** Roughly one token per four characters — used only to decide when to chunk. */
 const CHARS_PER_CHUNK = 240_000;
@@ -71,34 +75,56 @@ Rules:
 - Write in plain, concrete language. No filler, no restating the instructions, no meta-commentary about the transcript format.`;
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, type = '', retryable = false } = {}) {
+  constructor(message, { status = 0, type = '', retryable = false, retryAfterMs = 0 } = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.type = type;
     this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
+/** True when analysis can run: either a key is set, or a proxy holds one. */
 export function hasKey() {
-  return Boolean((getSetting('apiKey') || '').trim());
+  return usingProxy() || Boolean((getSetting('apiKey') || '').trim());
 }
 
-function headers(apiKey) {
-  return {
+/**
+ * Where requests go. Defaults to the Anthropic API directly; point it at a
+ * proxy (see proxy/) to keep the key off the device entirely, in which case
+ * the app sends no key at all and the proxy supplies it.
+ */
+function endpoint() {
+  const base = (getSetting('apiBaseUrl') || '').trim().replace(/\/+$/, '') || DEFAULT_BASE_URL;
+  return `${base}/v1/messages`;
+}
+
+function usingProxy() {
+  const base = (getSetting('apiBaseUrl') || '').trim();
+  return Boolean(base) && base.replace(/\/+$/, '') !== DEFAULT_BASE_URL;
+}
+
+function headers() {
+  const base = {
     'content-type': 'application/json',
-    'x-api-key': apiKey,
     'anthropic-version': API_VERSION,
+  };
+  if (usingProxy()) return base;
+  return {
+    ...base,
+    'x-api-key': (getSetting('apiKey') || '').trim(),
+    // Opts the request into CORS from a browser origin.
     'anthropic-dangerous-direct-browser-access': 'true',
   };
 }
 
-function requireKey() {
-  const apiKey = (getSetting('apiKey') || '').trim();
-  if (!apiKey) {
+/** A proxy holds the key server-side, so only the direct path needs one here. */
+function requireCredentials() {
+  if (usingProxy()) return;
+  if (!(getSetting('apiKey') || '').trim()) {
     throw new ApiError('No Anthropic API key is set. Add one in Settings to use AI analysis.', { type: 'no_key' });
   }
-  return apiKey;
 }
 
 /** Turn any failure into a message worth showing on a phone screen. */
@@ -112,6 +138,7 @@ async function toApiError(res) {
   } catch { /* non-JSON error body */ }
 
   const messages = {
+    400: 'The API rejected the request as malformed.',
     401: 'That API key was rejected. Check it in Settings.',
     403: 'This API key is not allowed to use the Messages API.',
     404: 'The selected model is not available to this API key.',
@@ -121,24 +148,96 @@ async function toApiError(res) {
     529: 'The API is overloaded right now. Try again in a minute.',
   };
   const message = messages[res.status] || `Request failed (HTTP ${res.status}).`;
+  const retryAfter = Number(res.headers.get('retry-after'));
   return new ApiError(detail ? `${message} ${detail}` : message, {
     status: res.status,
     type,
     retryable: res.status === 429 || res.status >= 500,
+    retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 0,
   });
 }
+
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener('abort', () => {
+    clearTimeout(timer);
+    reject(new DOMException('Aborted', 'AbortError'));
+  }, { once: true });
+});
 
 /**
  * POST a Messages request and stream the text back.
  * @returns {Promise<{text: string, stopReason: string, usage: object}>}
  */
-async function streamMessage(body, { onText, signal } = {}) {
-  const apiKey = requireKey();
+async function streamMessage(body, { onText, signal, onRetry } = {}) {
+  requireCredentials();
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted?.();
+    try {
+      return await streamOnce(body, { onText, signal });
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      lastError = err;
+      // Only retry transient failures, and only if nothing was emitted yet —
+      // a stream that already produced text cannot be safely restarted.
+      if (!(err instanceof ApiError) || !err.retryable || err.emitted || attempt === MAX_ATTEMPTS) throw err;
+      const wait = err.retryAfterMs || BASE_BACKOFF_MS * 2 ** (attempt - 1);
+      onRetry?.({ attempt, of: MAX_ATTEMPTS, waitMs: wait, message: err.message });
+      await sleep(wait, signal);
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Incremental Server-Sent Events decoder.
+ *
+ * Pure and framing-only: `push` takes whatever arrived and returns the JSON
+ * payloads of any complete frames, holding the remainder for next time.
+ */
+export class SseDecoder {
+  constructor() {
+    this.buffer = '';
+    this.decoder = new TextDecoder();
+  }
+
+  /**
+   * @param {Uint8Array|string} chunk
+   * @returns {object[]} parsed `data:` payloads from complete frames
+   */
+  push(chunk) {
+    const text = typeof chunk === 'string' ? chunk : this.decoder.decode(chunk, { stream: true });
+    this.buffer += text.replace(/\r\n/g, '\n');
+
+    const events = [];
+    let split;
+    while ((split = this.buffer.indexOf('\n\n')) !== -1) {
+      const frame = this.buffer.slice(0, split);
+      this.buffer = this.buffer.slice(split + 2);
+      for (const line of frame.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          events.push(JSON.parse(payload));
+        } catch {
+          // A truncated or malformed frame is not worth failing the stream over.
+        }
+      }
+    }
+    return events;
+  }
+}
+
+/** One attempt: POST, then fold the SSE events into a message. */
+async function streamOnce(body, { onText, signal } = {}) {
   let res;
   try {
-    res = await fetch(ENDPOINT, {
+    res = await fetch(endpoint(), {
       method: 'POST',
-      headers: headers(apiKey),
+      headers: headers(),
       body: JSON.stringify({ ...body, stream: true }),
       signal,
     });
@@ -146,66 +245,63 @@ async function streamMessage(body, { onText, signal } = {}) {
     if (err?.name === 'AbortError') throw err;
     throw new ApiError(
       navigator.onLine
-        ? 'Could not reach the Anthropic API. Check your connection and try again.'
+        ? 'Could not reach the API. Check your connection and try again.'
         : 'You are offline. Connect to a network to run AI analysis.',
       { type: 'network', retryable: true },
     );
   }
   if (!res.ok) throw await toApiError(res);
-  if (!res.body) throw new ApiError('The API returned an empty response.', { status: res.status });
+  if (!res.body) throw new ApiError('The API returned an empty response.', { status: res.status, retryable: true });
 
   const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let text = '';
-  let stopReason = '';
-  let stopDetails = null;
-  let usage = {};
+  const sse = new SseDecoder();
+  const message = { text: '', stopReason: '', stopDetails: null, usage: {} };
 
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    // SSE frames are separated by a blank line.
-    let split;
-    while ((split = buffer.indexOf('\n\n')) !== -1) {
-      const frame = buffer.slice(0, split);
-      buffer = buffer.slice(split + 2);
-      for (const line of frame.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        let event;
-        try {
-          event = JSON.parse(payload);
-        } catch {
-          continue;
-        }
-        if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-          text += event.delta.text;
-          onText?.(event.delta.text, text);
-        } else if (event.type === 'message_delta') {
-          if (event.delta?.stop_reason) stopReason = event.delta.stop_reason;
-          if (event.delta?.stop_details) stopDetails = event.delta.stop_details;
-          if (event.usage) usage = { ...usage, ...event.usage };
-        } else if (event.type === 'message_start' && event.message?.usage) {
-          usage = { ...usage, ...event.message.usage };
-        } else if (event.type === 'error') {
-          throw new ApiError(event.error?.message || 'The API reported a streaming error.', {
-            type: event.error?.type || 'stream_error',
-            retryable: true,
-          });
-        }
-      }
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (const event of sse.push(value)) applyEvent(message, event, onText);
     }
+  } catch (err) {
+    // A stream that already produced text cannot be safely replayed, so mark
+    // it and let the retry loop give up rather than duplicate output.
+    if (err instanceof ApiError) err.emitted = message.text.length > 0;
+    throw err;
   }
 
-  if (stopReason === 'refusal') {
-    const category = stopDetails?.category ? ` (${stopDetails.category})` : '';
+  if (message.stopReason === 'refusal') {
+    const category = message.stopDetails?.category ? ` (${message.stopDetails.category})` : '';
     throw new ApiError(`Claude declined to analyse this recording${category}.`, { type: 'refusal' });
   }
-  return { text, stopReason, usage };
+  return { text: message.text, stopReason: message.stopReason, usage: message.usage };
+}
+
+/** Fold one streaming event into the accumulating message. */
+function applyEvent(message, event, onText) {
+  switch (event.type) {
+    case 'content_block_delta':
+      if (event.delta?.type === 'text_delta') {
+        message.text += event.delta.text;
+        onText?.(event.delta.text, message.text);
+      }
+      break;
+    case 'message_delta':
+      if (event.delta?.stop_reason) message.stopReason = event.delta.stop_reason;
+      if (event.delta?.stop_details) message.stopDetails = event.delta.stop_details;
+      if (event.usage) message.usage = { ...message.usage, ...event.usage };
+      break;
+    case 'message_start':
+      if (event.message?.usage) message.usage = { ...message.usage, ...event.message.usage };
+      break;
+    case 'error':
+      throw new ApiError(event.error?.message || 'The API reported a streaming error.', {
+        type: event.error?.type || 'stream_error',
+        retryable: true,
+      });
+    default:
+      break;
+  }
 }
 
 /** Base request fields shared by every call, honouring the model's capabilities. */
@@ -269,7 +365,7 @@ function chunkTranscript(text, size = CHARS_PER_CHUNK) {
  * @param {object} meeting
  * @param {{onProgress?: (stage: string, pct: number) => void, signal?: AbortSignal}} opts
  */
-export async function analyzeMeeting(meeting, { onProgress, signal } = {}) {
+export async function analyzeMeeting(meeting, { onProgress, signal, onRetry } = {}) {
   const transcript = transcriptText(meeting);
   if (!transcript.trim()) {
     throw new ApiError('There is no transcript to analyse yet.', { type: 'empty' });
@@ -291,7 +387,7 @@ export async function analyzeMeeting(meeting, { onProgress, signal } = {}) {
           role: 'user',
           content: `This is part ${i + 1} of ${chunks.length} of a long transcript. Write dense notes covering everything decided, committed to, questioned or agreed in this part. Keep names, numbers and dates verbatim. Do not summarise away detail — later parts depend on it.\n\n<transcript_part>\n${chunks[i]}\n</transcript_part>`,
         }],
-      }, { signal });
+      }, { signal, onRetry });
       notes.push(`--- Part ${i + 1} ---\n${text}`);
     }
     material = notes.join('\n\n');
@@ -315,6 +411,7 @@ export async function analyzeMeeting(meeting, { onProgress, signal } = {}) {
     }],
   }, {
     signal,
+    onRetry,
     onText: (_delta, full) => {
       // Rough progress from output length — enough to keep the bar moving.
       onProgress?.('Writing the summary', Math.min(0.98, 0.75 + (full.length / 4000) * 0.23));
@@ -362,7 +459,7 @@ export function normalizeAnalysis(data, meta = {}) {
 }
 
 /** Free-form follow-up question about one meeting. Streams the answer back. */
-export async function askAboutMeeting(meeting, question, { onText, signal, history = [] } = {}) {
+export async function askAboutMeeting(meeting, question, { onText, signal, onRetry, history = [] } = {}) {
   const transcript = transcriptText(meeting);
   const priorTurns = history.slice(-8).map((turn) => ({
     role: turn.role === 'assistant' ? 'assistant' : 'user',
@@ -373,7 +470,7 @@ export async function askAboutMeeting(meeting, question, { onText, signal, histo
     ...baseRequest({ maxTokens: 4000 }),
     system: `${SYSTEM_PROMPT}\n\nThe user is asking follow-up questions about one recording. Answer only from the transcript below. If the answer is not in it, say so in one sentence. Be brief — this is read on a phone.\n\n<context>\n${contextBlock(meeting)}\n</context>\n\n<transcript>\n${transcript}\n</transcript>`,
     messages: [...priorTurns, { role: 'user', content: question }],
-  }, { onText, signal });
+  }, { onText, signal, onRetry });
 
   return text.trim();
 }

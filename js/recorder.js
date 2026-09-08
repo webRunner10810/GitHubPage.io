@@ -3,6 +3,10 @@
  * Wraps getUserMedia + MediaRecorder and exposes a monotonic recording clock
  * that excludes paused time, so transcript timestamps line up with the saved
  * audio file on playback.
+ *
+ * Chunks are emitted as `chunk` events rather than accumulated here. The
+ * caller persists each one immediately, which is what makes an interrupted
+ * recording recoverable and keeps a long meeting off the heap.
  */
 
 const MIME_CANDIDATES = [
@@ -31,7 +35,7 @@ export class Recorder extends EventTarget {
     this.state = 'idle';        // idle | recording | paused | stopped
     this.stream = null;
     this.recorder = null;
-    this.chunks = [];
+    this.chunkIndex = 0;
     this.mimeType = '';
     this.wakeLock = null;
     this._startedAt = 0;        // performance.now() when the current run began
@@ -65,9 +69,13 @@ export class Recorder extends EventTarget {
     if (captureAudio) {
       this.mimeType = pickMimeType();
       this.recorder = new MediaRecorder(this.stream, this.mimeType ? { mimeType: this.mimeType, audioBitsPerSecond: 64000 } : undefined);
-      this.chunks = [];
+      this.chunkIndex = 0;
       this.recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size) this.chunks.push(e.data);
+        if (!e.data || !e.data.size) return;
+        this.dispatchEvent(new CustomEvent('chunk', {
+          detail: { blob: e.data, index: this.chunkIndex },
+        }));
+        this.chunkIndex += 1;
       };
       this.recorder.onerror = (e) => this.dispatchEvent(new CustomEvent('error', { detail: e.error || e }));
       // A 1s timeslice keeps data flushing so a crash loses at most a second.
@@ -98,33 +106,43 @@ export class Recorder extends EventTarget {
     this.dispatchEvent(new CustomEvent('statechange', { detail: this.state }));
   }
 
-  /** Stops capture and resolves with { blob, mimeType, durationMs }. */
+  /**
+   * Stops capture. Resolves once MediaRecorder has flushed its final chunk —
+   * every `chunk` event has been dispatched by then, so the caller only has to
+   * await its own outstanding writes.
+   * @returns {Promise<{mimeType: string, durationMs: number, chunkCount: number}>}
+   */
   async stop() {
+    const result = () => ({ mimeType: this.mimeType, durationMs: this._accumulated, chunkCount: this.chunkIndex });
     if (this.state === 'idle' || this.state === 'stopped') {
-      return { blob: null, mimeType: this.mimeType, durationMs: this.elapsed() };
+      return { mimeType: this.mimeType, durationMs: this.elapsed(), chunkCount: this.chunkIndex };
     }
     if (this.state === 'recording') this._accumulated += performance.now() - this._startedAt;
-    const durationMs = this._accumulated;
 
-    const blob = await new Promise((resolve) => {
+    await new Promise((resolve) => {
       if (!this.recorder || this.recorder.state === 'inactive') {
-        resolve(this.chunks.length ? new Blob(this.chunks, { type: this.mimeType || 'audio/webm' }) : null);
+        resolve();
         return;
       }
+      // Guard against a browser that never fires onstop, so a stop can never
+      // hang the UI with the meeting unsaved.
+      const timer = setTimeout(resolve, 4000);
       this.recorder.onstop = () => {
-        resolve(this.chunks.length ? new Blob(this.chunks, { type: this.mimeType || 'audio/webm' }) : null);
+        clearTimeout(timer);
+        resolve();
       };
       try {
         this.recorder.stop();
       } catch {
-        resolve(this.chunks.length ? new Blob(this.chunks, { type: this.mimeType || 'audio/webm' }) : null);
+        clearTimeout(timer);
+        resolve();
       }
     });
 
     this._teardown();
     this.state = 'stopped';
     this.dispatchEvent(new CustomEvent('statechange', { detail: this.state }));
-    return { blob, mimeType: this.mimeType, durationMs };
+    return result();
   }
 
   /** Abandon the recording without producing a file. */
@@ -132,11 +150,19 @@ export class Recorder extends EventTarget {
     try {
       if (this.recorder && this.recorder.state !== 'inactive') this.recorder.stop();
     } catch { /* already stopped */ }
-    this.chunks = [];
     this._teardown();
     this.state = 'idle';
     this._accumulated = 0;
+    this.chunkIndex = 0;
     this.dispatchEvent(new CustomEvent('statechange', { detail: this.state }));
+  }
+
+  /** Stop writing audio but keep the clock and the microphone running. */
+  dropAudio() {
+    try {
+      if (this.recorder && this.recorder.state !== 'inactive') this.recorder.stop();
+    } catch { /* already stopped */ }
+    this.recorder = null;
   }
 
   /* ------------------------------------------------------------ metering */

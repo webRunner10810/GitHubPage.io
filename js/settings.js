@@ -11,6 +11,7 @@ const KEY = 'summary.settings.v1';
 
 const DEFAULTS = {
   apiKey: '',
+  apiBaseUrl: '',             // set to a proxy origin to keep the key off-device
   model: 'claude-opus-5',
   effort: 'high',
   language: 'en-US',

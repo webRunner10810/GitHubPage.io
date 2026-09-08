@@ -36,10 +36,9 @@ const ctx = {
     backBtn.hidden = !back;
     backBtn.onclick = back ? () => { location.hash = back; } : null;
     topbarActions.replaceChildren(...actions.map((action) => el('button', {
-      class: 'icon-btn',
       type: 'button',
       'aria-label': action.label,
-      style: action.active ? 'color:#ffcf5c' : '',
+      class: `icon-btn${action.active ? ' starred' : ''}`,
       onclick: action.onClick,
     }, icon(action.icon))));
   },
@@ -52,7 +51,7 @@ function syncTabs(tab) {
   });
 }
 
-async function route() {
+function route() {
   const hash = location.hash || '#/record';
   if (hash === currentHash) return;
 
@@ -136,13 +135,13 @@ let installPrompt = null;
 window.addEventListener('beforeinstallprompt', (e) => {
   e.preventDefault();
   installPrompt = e;
-  const bar = el('div', { class: 'toast', style: 'pointer-events:auto' },
+  const bar = el('div', { class: 'toast interactive' },
     el('div', { class: 'row-between' },
       el('span', {}, 'Install Summary for offline use'),
       el('button', {
         class: 'btn btn-sm btn-primary',
         type: 'button',
-        onclick: async () => {
+        onclick: () => {
           bar.remove();
           installPrompt?.prompt();
           installPrompt = null;

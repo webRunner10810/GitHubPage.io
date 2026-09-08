@@ -6,7 +6,9 @@
  * is injected via `clock`, which keeps segments aligned with the audio file.
  */
 
-const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+// Read through globalThis so the module can be imported outside a browser
+// (the unit tests exercise the pure transforms at the bottom of this file).
+const SpeechRecognitionImpl = globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
 
 export function isSupported() {
   return Boolean(SpeechRecognitionImpl);

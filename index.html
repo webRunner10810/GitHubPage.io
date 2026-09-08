@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Summary — AI Meeting Notes</title>
 <meta name="description" content="Record meetings and calls, transcribe them live, and turn them into summaries, decisions and action items.">
+<!-- No inline scripts, no external scripts, no remote assets: everything the
+     app needs is same-origin. connect-src also allows the Anthropic API and,
+     for a proxy deployment, any https origin the user configures in Settings.
+     frame-ancestors is omitted deliberately — it is ignored in a meta tag, and
+     GitHub Pages cannot send response headers. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; connect-src 'self' https://api.anthropic.com https:; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0b0f14">
 <meta name="color-scheme" content="dark">
 <meta name="mobile-web-app-capable" content="yes">

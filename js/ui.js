@@ -1,6 +1,6 @@
 /* Shared UI primitives: toasts, bottom sheets, confirm/prompt dialogs. */
 
-import { $, el, haptic, icon } from './util.js';
+import { $, el, icon } from './util.js';
 
 export function toast(message, kind = '', ms = 3200) {
   const stack = $('#toast-stack');
@@ -50,7 +50,6 @@ export function sheet(render, { dismissible = true } = {}) {
     };
     document.addEventListener('keydown', onKey);
     closeCurrentSheet = () => close(undefined);
-    haptic(8);
 
     // Focus the first control so keyboards and screen readers land inside.
     setTimeout(() => panel.querySelector('input, textarea, button')?.focus(), 60);
@@ -61,7 +60,7 @@ export function confirmSheet({ title, body, confirmLabel = 'Confirm', danger = f
   return sheet((close) => el('div', { class: 'stack' },
     el('h2', {}, title),
     body ? el('p', { class: 'muted small' }, body) : null,
-    el('div', { class: 'stack', style: 'margin-top:6px' },
+    el('div', { class: 'stack mt-6' },
       el('button', {
         class: `btn btn-block ${danger ? 'btn-danger' : 'btn-primary'}`,
         type: 'button',
@@ -93,8 +92,8 @@ export function promptSheet({ title, label, value = '', placeholder = '', multil
 export function emptyState(iconName, title, body, action) {
   return el('div', { class: 'empty' },
     icon(iconName),
-    el('h3', { style: 'margin-bottom:6px' }, title),
-    el('p', { class: 'small', style: 'margin:0 0 16px' }, body),
+    el('h3', { class: 'mb-6' }, title),
+    el('p', { class: 'small empty-copy' }, body),
     action || null);
 }
 
